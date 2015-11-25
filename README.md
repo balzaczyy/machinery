@@ -1,16 +1,16 @@
-[1]: /assets/example_worker.png
-[2]: /assets/example_worker_receives_tasks.png
+[1]: https://raw.githubusercontent.com/RichardKnop/assets/master/machinery/example_worker.png
+[2]: https://raw.githubusercontent.com/RichardKnop/assets/master/machinery/example_worker_receives_tasks.png
 
-[![GoDoc](https://img.shields.io/badge/godoc-reference-blue.svg "GoDoc")](http://godoc.org/github.com/RichardKnop/machinery/v1)
-![Build Status](https://travis-ci.org/RichardKnop/machinery.svg?branch=master)
+[![Codeship Status for RichardKnop/go-oauth2-server](https://codeship.com/projects/35dc5880-71a7-0133-ec05-06b1c29ec1d7/status?branch=master)](https://codeship.com/projects/116440)
+
+[![GoDoc](https://img.shields.io/badge/godoc-reference-blue.svg)](http://godoc.org/github.com/RichardKnop/machinery/v1)
+[![Travis Status for RichardKnop/machinery](https://travis-ci.org/RichardKnop/machinery.svg?branch=master)](https://travis-ci.org/RichardKnop/machinery)
 
 # Machinery
 
 Machinery is an asynchronous task queue/job queue based on distributed message passing.
 
 So called tasks (or jobs if you like) are executed concurrently either by many workers on many servers or multiple worker processes on a single server using Golang's goroutines.
-
-This is an early stage project so far. Feel free to contribute.
 
 - [First Steps](https://github.com/RichardKnop/machinery#first-steps)
 - [Configuration](https://github.com/RichardKnop/machinery#configuration)
@@ -83,17 +83,19 @@ type Config struct {
 A message broker. Currently supported brokers are:
 
 * AMQP (use AMQP URL such as `amqp://guest:guest@localhost:5672/`)
-* Redis (use Redis URL such as `redis://127.0.0.1:6379`)
+* Redis (use Redis URL such as `redis://127.0.0.1:6379`, or to use password redis://password@127.0.0.1:6379)
 
 ### ResultBackend
 
-Result backend to use for keeping task states and results. This setting is optional, you can run Machinery without keeping track of task results.
+Result backend to use for keeping task states and results.
 
 Currently supported backends are:
 
-* AMQP (use AMQP URL such as `amqp://guest:guest@localhost:5672/`)
-* Redis (use Redis URL such as `redis://127.0.0.1:6379`)
+* Redis (use Redis URL such as `redis://127.0.0.1:6379`, or to use password `redis://password@127.0.0.1:6379`)
 * Memcache (use Memcache URL such as `memcache://10.0.0.1:11211,10.0.0.2:11211`)
+* AMQP (use AMQP URL such as `amqp://guest:guest@localhost:5672/`)
+
+> Keep in mind AMQP is not recommended as a result backend. See [Keeping Results](https://github.com/RichardKnop/machinery#keeping-results)
 
 ### ResultsExpireIn
 
@@ -343,18 +345,17 @@ type TaskState struct {
     Error    string
 }
 
-type TaskStateGroup struct {
-    GroupUUID      string
-    GroupTaskCount int
-    States         map[string]TaskState
+type GroupMeta struct {
+	GroupUUID string
+	TaskUUIDs []string
 }
 ```
 
 `TaskResult` represents a return value of a processed task.
 
-`TaskState` struct will be serialized and stored every time a task state changes.
+`TaskState` struct will be serialised and stored every time a task state changes.
 
-`TaskStateGroup` is used for keeping a state of group of tasks.
+`GroupMeta` stores useful metadata about tasks within the same group. E.g. UUIDs of all tasks which are used in order to check if all tasks completed successfully or not and thus whether to trigger chord callback.
 
 `AsyncResult` object allows you to check for the state of a task:
 

@@ -7,59 +7,137 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RichardKnop/machinery/Godeps/_workspace/src/github.com/garyburd/redigo/redis"
 	"github.com/RichardKnop/machinery/v1/config"
 	"github.com/RichardKnop/machinery/v1/signatures"
 	"github.com/RichardKnop/machinery/v1/utils"
+	"github.com/garyburd/redigo/redis"
 )
 
 // RedisBroker represents a Redis broker
 type RedisBroker struct {
-	config    *config.Config
-	host      string
-	retryFunc func()
-	quitChan  chan int
-	stopChan  chan int
-	wg        sync.WaitGroup
+	config              *config.Config
+	registeredTaskNames []string
+	host                string
+	password            string
+	pool                *redis.Pool
+	retryFunc           func()
+	stopChan            chan int
+	stopReceivingChan   chan int
+	errorsChan          chan error
+	wg                  sync.WaitGroup
 }
 
 // NewRedisBroker creates new RedisBroker instance
-func NewRedisBroker(cnf *config.Config, host string) Broker {
+func NewRedisBroker(cnf *config.Config, host, password string) Broker {
 	return Broker(&RedisBroker{
-		config: cnf,
-		host:   host,
+		config:   cnf,
+		host:     host,
+		password: password,
 	})
+}
+
+// SetRegisteredTaskNames sets registered task names
+func (redisBroker *RedisBroker) SetRegisteredTaskNames(names []string) {
+	redisBroker.registeredTaskNames = names
+}
+
+// IsTaskRegistered returns true if the task is registered with this broker
+func (redisBroker *RedisBroker) IsTaskRegistered(name string) bool {
+	for _, registeredTaskName := range redisBroker.registeredTaskNames {
+		if registeredTaskName == name {
+			return true
+		}
+	}
+	return false
 }
 
 // StartConsuming enters a loop and waits for incoming messages
 func (redisBroker *RedisBroker) StartConsuming(consumerTag string, taskProcessor TaskProcessor) (bool, error) {
-	redisBroker.stopChan = make(chan int)
-	redisBroker.quitChan = make(chan int)
-	redisBroker.wg.Add(1)
-	errorsChan := make(chan error)
 	if redisBroker.retryFunc == nil {
 		redisBroker.retryFunc = utils.RetryClosure()
 	}
 
-	go redisBroker.consume(errorsChan, taskProcessor)
+	redisBroker.pool = redisBroker.newPool()
+	defer redisBroker.pool.Close()
 
-	for {
-		select {
-		case err := <-errorsChan:
-			return true, err // retry true
-		case <-redisBroker.stopChan:
-			return false, nil // retry false
-		}
+	_, err := redisBroker.pool.Get().Do("PING")
+	if err != nil {
+		redisBroker.retryFunc()
+		return true, err // retry true
 	}
+
+	redisBroker.retryFunc = utils.RetryClosure()
+	redisBroker.stopChan = make(chan int)
+	redisBroker.stopReceivingChan = make(chan int)
+	redisBroker.errorsChan = make(chan error)
+	deliveries := make(chan []byte)
+
+	redisBroker.wg.Add(1)
+
+	go func() {
+		defer redisBroker.wg.Done()
+
+		log.Print("[*] Waiting for messages. To exit press CTRL+C")
+
+		conn := redisBroker.pool.Get()
+
+		for {
+			select {
+			// A way to stop this goroutine from redisBroker.StopConsuming
+			case <-redisBroker.stopReceivingChan:
+				return
+			default:
+				itemBytes, err := conn.Do("LPOP", redisBroker.config.DefaultQueue)
+				if err != nil {
+					redisBroker.errorsChan <- err
+					return
+				}
+				// Unline BLPOP, LPOP is non blocking so nil means we can keep iterating
+				if itemBytes == nil {
+					continue
+				}
+
+				item, err := redis.Bytes(itemBytes, nil)
+				if err != nil {
+					redisBroker.errorsChan <- err
+					return
+				}
+
+				signature := signatures.TaskSignature{}
+				if err := json.Unmarshal(item, &signature); err != nil {
+					redisBroker.errorsChan <- err
+					return
+				}
+
+				// If the task is not registered, we requeue it,
+				// there might be different workers for processing specific tasks
+				if !redisBroker.IsTaskRegistered(signature.Name) {
+					_, err := conn.Do("RPUSH", redisBroker.config.DefaultQueue, item)
+
+					if err != nil {
+						redisBroker.errorsChan <- err
+						return
+					}
+
+					continue
+				}
+
+				deliveries <- item
+			}
+		}
+	}()
+
+	if err := redisBroker.consume(deliveries, taskProcessor); err != nil {
+		return true, err // retry true
+	}
+
+	return false, nil
 }
 
 // StopConsuming quits the loop
 func (redisBroker *RedisBroker) StopConsuming() {
-	// Notifying the quit channel stops receiving goroutine
-	redisBroker.quitChan <- 1
-	// Wait for the receiving goroutine to have stopped
-	redisBroker.wg.Wait()
-	// Notifying the quit channel stops consuming of messages
+	redisBroker.stopReceiving()
+	// Notifying the stop channel stops consuming of messages
 	redisBroker.stopChan <- 1
 }
 
@@ -67,7 +145,7 @@ func (redisBroker *RedisBroker) StopConsuming() {
 func (redisBroker *RedisBroker) Publish(signature *signatures.TaskSignature) error {
 	conn, err := redisBroker.open()
 	if err != nil {
-		fmt.Errorf("Dial: %s", err)
+		return fmt.Errorf("Dial: %s", err)
 	}
 	defer conn.Close()
 
@@ -80,64 +158,52 @@ func (redisBroker *RedisBroker) Publish(signature *signatures.TaskSignature) err
 	return err
 }
 
-// Consumes messages
-func (redisBroker *RedisBroker) consume(errorsChan chan error, taskProcessor TaskProcessor) {
-	defer redisBroker.wg.Done()
+// Consume a single message
+func (redisBroker *RedisBroker) consumeOne(item []byte, taskProcessor TaskProcessor) {
+	log.Printf("Received new message: %s", item)
 
+	signature := signatures.TaskSignature{}
+	if err := json.Unmarshal(item, &signature); err != nil {
+		redisBroker.errorsChan <- err
+		return
+	}
+
+	if err := taskProcessor.Process(&signature); err != nil {
+		redisBroker.errorsChan <- err
+	}
+}
+
+// Consumes messages...
+func (redisBroker *RedisBroker) consume(deliveries <-chan []byte, taskProcessor TaskProcessor) error {
 	for {
-		conn, err := redisBroker.open()
-		if err != nil {
-			redisBroker.retryFunc()
-			errorsChan <- err
-			return
-		}
-
-		redisBroker.retryFunc = utils.RetryClosure()
-
-		defer conn.Close()
-
-		log.Print("[*] Waiting for messages. To exit press CTRL+C")
-
 		select {
-		case <-redisBroker.quitChan:
-			return
-		default:
-			// Return value of BLPOP is an array. For example:
-			// redis> RPUSH list1 a b c
-			// (integer) 3
-			// redis> BLPOP list1 list2 0
-			// 1) "list1"
-			// 2) "a"
-			multiBulk, err := redis.MultiBulk(conn.Do("BLPOP", redisBroker.config.DefaultQueue, "0"))
-			if err != nil {
-				errorsChan <- err
-				return
-			}
-
-			item, err := redis.Bytes(multiBulk[1], nil)
-			if err != nil {
-				errorsChan <- err
-				return
-			}
-
-			log.Printf("Received new message: %s", item)
-
-			signature := signatures.TaskSignature{}
-			if err := json.Unmarshal(item, &signature); err != nil {
-				errorsChan <- err
-				return
-			}
-
-			if err := taskProcessor.Process(&signature); err != nil {
-				errorsChan <- err
-				return
-			}
+		case err := <-redisBroker.errorsChan:
+			return err
+		case d := <-deliveries:
+			// Consume the task inside a gotourine so multiple tasks
+			// can be processed concurrently
+			go func() {
+				redisBroker.consumeOne(d, taskProcessor)
+			}()
+		case <-redisBroker.stopChan:
+			return nil
 		}
 	}
 }
 
+// Stops the receving goroutine
+func (redisBroker *RedisBroker) stopReceiving() {
+	redisBroker.stopReceivingChan <- 1
+	// Waiting for the receiving goroutine to have stopped
+	redisBroker.wg.Wait()
+}
+
 // Returns / creates instance of Redis connection
 func (redisBroker *RedisBroker) open() (redis.Conn, error) {
+	if redisBroker.password != "" {
+		return redis.Dial("tcp", redisBroker.host,
+			redis.DialPassword(redisBroker.password))
+	}
 	return redis.Dial("tcp", redisBroker.host)
 }
 
@@ -147,7 +213,16 @@ func (redisBroker *RedisBroker) newPool() *redis.Pool {
 		MaxIdle:     3,
 		IdleTimeout: 240 * time.Second,
 		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", redisBroker.host)
+			var c redis.Conn
+			var err error
+
+			if redisBroker.password != "" {
+				c, err = redis.Dial("tcp", redisBroker.host,
+					redis.DialPassword(redisBroker.password))
+			} else {
+				c, err = redis.Dial("tcp", redisBroker.host)
+			}
+
 			if err != nil {
 				return nil, err
 			}

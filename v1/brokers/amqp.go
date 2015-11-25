@@ -2,20 +2,26 @@ package brokers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"sync"
 
-	"github.com/RichardKnop/machinery/Godeps/_workspace/src/github.com/streadway/amqp"
 	"github.com/RichardKnop/machinery/v1/config"
 	"github.com/RichardKnop/machinery/v1/signatures"
 	"github.com/RichardKnop/machinery/v1/utils"
+	"github.com/streadway/amqp"
 )
+
+var once sync.Once
+var conn *amqp.Connection
 
 // AMQPBroker represents an AMQP broker
 type AMQPBroker struct {
-	config    *config.Config
-	retryFunc func()
-	stopChan  chan int
+	config              *config.Config
+	registeredTaskNames []string
+	retryFunc           func()
+	stopChan            chan int
 }
 
 // NewAMQPBroker creates new AMQPBroker instance
@@ -25,21 +31,35 @@ func NewAMQPBroker(cnf *config.Config) Broker {
 	})
 }
 
+// SetRegisteredTaskNames sets registered task names
+func (amqpBroker *AMQPBroker) SetRegisteredTaskNames(names []string) {
+	amqpBroker.registeredTaskNames = names
+}
+
+// IsTaskRegistered returns true if the task is registered with this broker
+func (amqpBroker *AMQPBroker) IsTaskRegistered(name string) bool {
+	for _, registeredTaskName := range amqpBroker.registeredTaskNames {
+		if registeredTaskName == name {
+			return true
+		}
+	}
+	return false
+}
+
 // StartConsuming enters a loop and waits for incoming messages
 func (amqpBroker *AMQPBroker) StartConsuming(consumerTag string, taskProcessor TaskProcessor) (bool, error) {
 	if amqpBroker.retryFunc == nil {
 		amqpBroker.retryFunc = utils.RetryClosure()
 	}
 
-	conn, channel, queue, _, err := amqpBroker.open()
+	_, channel, queue, _, err := amqpBroker.open()
+	defer channel.Close()
 	if err != nil {
 		amqpBroker.retryFunc()
 		return true, err // retry true
 	}
 
 	amqpBroker.retryFunc = utils.RetryClosure()
-
-	defer amqpBroker.close(channel, conn)
 
 	amqpBroker.stopChan = make(chan int)
 
@@ -75,18 +95,17 @@ func (amqpBroker *AMQPBroker) StartConsuming(consumerTag string, taskProcessor T
 
 // StopConsuming quits the loop
 func (amqpBroker *AMQPBroker) StopConsuming() {
-	// Notifying the quit channel stops consuming of messages
+	// Notifying the stop channel stops consuming of messages
 	amqpBroker.stopChan <- 1
 }
 
 // Publish places a new message on the default queue
 func (amqpBroker *AMQPBroker) Publish(signature *signatures.TaskSignature) error {
-	conn, channel, _, confirmsChan, err := amqpBroker.open()
+	_, channel, _, confirmsChan, err := amqpBroker.open()
+	defer channel.Close()
 	if err != nil {
 		return err
 	}
-
-	defer amqpBroker.close(channel, conn)
 
 	message, err := json.Marshal(signature)
 	if err != nil {
@@ -121,51 +140,86 @@ func (amqpBroker *AMQPBroker) Publish(signature *signatures.TaskSignature) error
 	return fmt.Errorf("Failed delivery of delivery tag: %v", confirmed.DeliveryTag)
 }
 
-// Consumes messages
-func (amqpBroker *AMQPBroker) consume(deliveries <-chan amqp.Delivery, taskProcessor TaskProcessor) error {
-	consumeOne := func(d amqp.Delivery) error {
-		log.Printf("Received new message: %s", d.Body)
-
-		signature := signatures.TaskSignature{}
-		if err := json.Unmarshal(d.Body, &signature); err != nil {
-			d.Nack(false, false) // multiple, requeue both false
-			return err
-		}
-
-		d.Ack(false) // multiple false
-
-		return taskProcessor.Process(&signature)
+// Consume a single message
+func (amqpBroker *AMQPBroker) consumeOne(d amqp.Delivery, taskProcessor TaskProcessor, errorsChan chan error) {
+	if len(d.Body) == 0 {
+		d.Nack(false, false)                                   // multiple, requeue
+		errorsChan <- errors.New("Received an empty message.") // RabbitMQ down?
+		return
 	}
 
+	log.Printf("Received new message: %s", d.Body)
+
+	signature := signatures.TaskSignature{}
+	if err := json.Unmarshal(d.Body, &signature); err != nil {
+		d.Nack(false, false) // multiple, requeue
+		errorsChan <- err
+		return
+	}
+
+	// If the task is not registered, we nack it and requeue,
+	// there might be different workers for processing specific tasks
+	if !amqpBroker.IsTaskRegistered(signature.Name) {
+		d.Nack(false, true) // multiple, requeue
+		return
+	}
+
+
+	if err := taskProcessor.Process(&signature); err != nil {
+		errorsChan <- err
+	}
+	
+	d.Ack(false) // multiple
+}
+
+// Consumes messages...
+func (amqpBroker *AMQPBroker) consume(deliveries <-chan amqp.Delivery, taskProcessor TaskProcessor) error {
+	errorsChan := make(chan error)
 	for {
 		select {
+		case err := <-errorsChan:
+			return err
 		case d := <-deliveries:
-			if err := consumeOne(d); err != nil {
-				return err
-			}
+			// Consume the task inside a gotourine so multiple tasks
+			// can be processed concurrently
+			go func() {
+				amqpBroker.consumeOne(d, taskProcessor, errorsChan)
+			}()
 		case <-amqpBroker.stopChan:
 			return nil
 		}
 	}
 }
 
-// Connects to the message queue, opens a channel, declares a queue
-func (amqpBroker *AMQPBroker) open() (*amqp.Connection, *amqp.Channel, amqp.Queue, <-chan amqp.Confirmation, error) {
-	var conn *amqp.Connection
-	var channel *amqp.Channel
-	var queue amqp.Queue
-	var err error
+// Connects to the message queue
+func (amqpBroker *AMQPBroker) connect() {
 
+	var err error
+	fmt.Println("connecting...")
 	conn, err = amqp.Dial(amqpBroker.config.Broker)
 	if err != nil {
-		return conn, channel, queue, nil, fmt.Errorf("Dial: %s", err)
+		fmt.Printf("Dial: %s\n", err)
+	}
+
+}
+
+// Connects to the message queue, opens a channel, declares a queue
+func (amqpBroker *AMQPBroker) open() (*amqp.Connection, *amqp.Channel, amqp.Queue, <-chan amqp.Confirmation, error) {
+	var err error
+	var channel *amqp.Channel
+	var queue amqp.Queue
+	if conn == nil {
+		once.Do(amqpBroker.connect)
+	}
+
+	if conn == nil {
+		return conn, channel, queue, nil, fmt.Errorf("Can't connect to the server")
 	}
 
 	channel, err = conn.Channel()
 	if err != nil {
-		return conn, channel, queue, nil, fmt.Errorf("Channel: %s", err)
+		fmt.Printf("Channel: %s\n", err)
 	}
-
 	if err := channel.ExchangeDeclare(
 		amqpBroker.config.Exchange,     // name of the exchange
 		amqpBroker.config.ExchangeType, // type
@@ -175,7 +229,7 @@ func (amqpBroker *AMQPBroker) open() (*amqp.Connection, *amqp.Channel, amqp.Queu
 		false, // noWait
 		nil,   // arguments
 	); err != nil {
-		return conn, channel, queue, nil, fmt.Errorf("Exchange: %s", err)
+		fmt.Printf("Exchange: %s\n", err)
 	}
 
 	queue, err = channel.QueueDeclare(
@@ -187,7 +241,7 @@ func (amqpBroker *AMQPBroker) open() (*amqp.Connection, *amqp.Channel, amqp.Queu
 		nil,   // arguments
 	)
 	if err != nil {
-		return conn, channel, queue, nil, fmt.Errorf("Queue Declare: %s", err)
+		fmt.Printf("Queue Declare: %s\n", err)
 	}
 
 	if err := channel.QueueBind(
@@ -197,29 +251,15 @@ func (amqpBroker *AMQPBroker) open() (*amqp.Connection, *amqp.Channel, amqp.Queu
 		false, // noWait
 		nil,   // arguments
 	); err != nil {
-		return conn, channel, queue, nil, fmt.Errorf("Queue Bind: %s", err)
+		fmt.Printf("Queue Bind: %s\n", err)
 	}
 
 	confirmsChan := make(chan amqp.Confirmation, 1)
-
 	// Enable publish confirmations
 	if err := channel.Confirm(false); err != nil {
 		close(confirmsChan)
-		return conn, channel, queue, nil, fmt.Errorf("Channel could not be put into confirm mode: %s", err)
+		fmt.Printf("Channel could not be put into confirm mode: %s\n", err)
 	}
 
 	return conn, channel, queue, channel.NotifyPublish(confirmsChan), nil
-}
-
-// Closes the connection
-func (amqpBroker *AMQPBroker) close(channel *amqp.Channel, conn *amqp.Connection) error {
-	if err := channel.Close(); err != nil {
-		return fmt.Errorf("Channel Close: %s", err)
-	}
-
-	if err := conn.Close(); err != nil {
-		return fmt.Errorf("Connection Close: %s", err)
-	}
-
-	return nil
 }
